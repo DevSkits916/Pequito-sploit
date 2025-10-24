@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RNG Analyzer</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="app-shell">
+    <header class="app-header">
+      <div class="badge">DevSkits916</div>
+      <h1>RNG Analyzer</h1>
+      <p class="subtitle">Infer simple RNG parameters and explore sample generators.</p>
+    </header>
+
+    <section class="card">
+      <h2>Input</h2>
+      <label for="sequence">Observed sequence (comma, space, or newline separated; hex like 0x123 allowed)</label>
+      <textarea id="sequence" rows="6" placeholder="e.g. 1043618065, 298178229, ..."></textarea>
+    </section>
+
+    <section class="card">
+      <h2>Options</h2>
+      <div class="options-grid">
+        <label>Forward predictions
+          <input type="number" id="forward-count" min="0" value="5" />
+        </label>
+        <label>Backward predictions
+          <input type="number" id="backward-count" min="0" value="5" />
+        </label>
+        <label>Algorithm mode
+          <select id="algorithm-mode">
+            <option value="auto">Auto Detect / Infer</option>
+            <option value="lcg">LCG (manual analyze)</option>
+            <option value="additive">Additive (manual analyze)</option>
+            <option value="xorshift">Xorshift demo</option>
+            <option value="mt19937">MT19937 demo</option>
+          </select>
+        </label>
+      </div>
+      <div class="button-row">
+        <button id="analyze-btn" class="primary">Analyze / Predict</button>
+        <button id="load-sample-btn">Load Sample Sequence for This Algorithm</button>
+      </div>
+    </section>
+
+    <section class="card" id="results-card">
+      <h2>Results</h2>
+      <div class="results-section">
+        <h3>Parameters</h3>
+        <pre id="parameters-output">—</pre>
+      </div>
+      <div class="results-section">
+        <h3>Forward predictions</h3>
+        <p class="hint">Predicted states after your last provided number.</p>
+        <pre id="forward-output">—</pre>
+      </div>
+      <div class="results-section">
+        <h3>Backward predictions</h3>
+        <p class="hint">States before your first provided number (starting with immediately previous).</p>
+        <pre id="backward-output">—</pre>
+      </div>
+      <div class="results-section">
+        <h3>Generated sequence</h3>
+        <pre id="generated-output">—</pre>
+      </div>
+    </section>
+
+    <section class="card hidden" id="error-card">
+      <h2>Error</h2>
+      <pre id="error-output"></pre>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
