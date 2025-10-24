@@ -1,6 +1,6 @@
 # RNG Analyzer
 https://pequito-sploit.vercel.app
-RNG Analyzer is an educational tool that helps you study simple random number generators (RNGs). Paste an observed integer sequence and the app will try to infer the algorithm that produced it, then predict both future and past values. The project supports two deployment modes so you can host a purely static version or a full-stack Flask deployment.
+RNG Analyzer is an educational tool that helps you study simple random number generators (RNGs). Paste an observed integer sequence and the app will try to infer the algorithm that produced it, the[...]
 
 ## Features
 - Reverse-engineer linear congruential generators (LCG) from at least four observed values.
