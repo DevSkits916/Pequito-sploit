@@ -1,5 +1,7 @@
-# RNG Analyzer
-https://devskits916.github.io/Pequito-sploit/
+https://pequito-sploit-1.onrender.com
+
+https://pequito-sploit-1.onrender.com
+
 RNG Analyzer is an educational tool that helps you study simple random number generators (RNGs). Paste an observed integer sequence and the app will try to infer the algorithm that produced it, then predict both future and past values. The project supports two deployment modes so you can host a purely static version or a full-stack Flask deployment.
 
 ## Features
