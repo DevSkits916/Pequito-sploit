@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple, Union
 
 from flask import Flask, request
+
+from rng_algorithms import (
+  ALGORITHMS,
+  ALGORITHM_MAP,
+  DETECTABLE_ALGORITHMS,
+  AlgorithmHandler,
+  AnalysisResult,
+)
+
+Number = Union[int, float]
 
 app = Flask(__name__)
 
@@ -15,203 +26,175 @@ class Result:
   backward: str = '—'
   generated: str = '—'
   error: Optional[str] = None
+  algorithm: Optional[str] = None
 
 
-SAMPLE_DATA = {
-  'lcg': {
-    'label': 'LCG demo',
-    'sequence': [
-      1250496027, 1116302264, 1000676753, 1668674806, 908095735,
-      915748896, 1544819687, 79942767, 1683185398, 823564440,
-    ],
-    'forward': 5,
-    'backward': 5,
-  },
-  'additive': {
-    'label': 'Additive demo',
-    'sequence': [1000, 1037, 1074, 1111, 1148, 1185, 1222, 1259, 1296, 1333],
-    'forward': 5,
-    'backward': 5,
-  },
-  'xorshift': {'label': 'Xorshift32 demo', 'seed': 0x12345678, 'count': 10},
-  'mt19937': {'label': 'MT19937 demo', 'seed': 5489, 'count': 10},
-}
+_GROUPED: OrderedDict[str, List[AlgorithmHandler]] = OrderedDict()
+for algorithm in ALGORITHMS:
+  _GROUPED.setdefault(algorithm.category, []).append(algorithm)
+ALGORITHM_GROUPS: List[Tuple[str, List[AlgorithmHandler]]] = list(_GROUPED.items())
+DEFAULT_ALGORITHM = ALGORITHM_MAP['lcg']
 
 
-def gcd(a: int, b: int) -> int:
-  a = abs(a)
-  b = abs(b)
-  while b:
-    a, b = b, a % b
-  return a
-
-
-def egcd(a: int, b: int) -> Tuple[int, int, int]:
-  if b == 0:
-    return a, 1, 0
-  g, x1, y1 = egcd(b, a % b)
-  x = y1
-  y = x1 - (a // b) * y1
-  return g, x, y
-
-
-def mod_inverse(a: int, m: int) -> Optional[int]:
-  a = (a % m + m) % m
-  g, x, _ = egcd(a, m)
-  if g != 1:
-    return None
-  return (x % m + m) % m
-
-
-def parse_sequence(raw: str) -> List[int]:
+def parse_sequence(raw: str) -> List[Number]:
   if not raw:
     return []
   clean = raw.replace('\n', ' ').replace(',', ' ')
   tokens = [token.strip() for token in clean.split()]
-  result = []
+  result: List[Number] = []
   for token in tokens:
     if not token:
       continue
-    base = 16 if token.lower().startswith('0x') else 10
     try:
-      value = int(token, base=base)
+      value = int(token, 0)
+      result.append(value)
+      continue
+    except ValueError:
+      pass
+    try:
+      value = float(token)
     except ValueError:
       continue
     result.append(value)
   return result
 
 
-def infer_modulus(seq: List[int]) -> int:
-  values = []
-  for i in range(len(seq) - 3):
-    x0, x1, x2, x3 = seq[i : i + 4]
-    t = (x3 - x2) * (x1 - x0) - (x2 - x1) * (x2 - x1)
-    if t:
-      values.append(abs(t))
-  if not values:
-    raise ValueError('Unable to infer modulus: no non-zero determinant differences.')
-  modulus = values[0]
-  for value in values[1:]:
-    modulus = gcd(modulus, value)
-  return modulus
+def _value_to_string(value: Number) -> str:
+  if isinstance(value, float):
+    return f'{value:.12g}'
+  return str(value)
 
 
-def infer_lcg(seq: List[int]) -> Tuple[int, int, int]:
-  if len(seq) < 4:
-    raise ValueError('Need at least four values to infer an LCG.')
-  modulus = infer_modulus(seq)
-  if modulus <= 0:
-    raise ValueError('Inferred modulus is not positive.')
-  multiplier = increment = None
-  for i in range(len(seq) - 2):
-    x0, x1, x2 = seq[i : i + 3]
-    delta = (x1 - x0) % modulus
-    if delta == 0:
-      continue
-    inv = mod_inverse(delta, modulus)
-    if inv is None:
-      continue
-    multiplier = ((x2 - x1) % modulus) * inv % modulus
-    increment = (x1 - multiplier * x0) % modulus
-    break
-  if multiplier is None or increment is None:
-    raise ValueError('Unable to determine multiplier and increment.')
-  for i in range(len(seq) - 1):
-    predicted = (multiplier * seq[i] + increment) % modulus
-    if predicted != seq[i + 1] % modulus:
-      raise ValueError('Inferred parameters do not reproduce the provided sequence.')
-  return multiplier, increment, modulus
+def format_values(values: Iterable[Number]) -> str:
+  materialised = list(values)
+  if not materialised:
+    return '—'
+  return ', '.join(_value_to_string(value) for value in materialised)
 
 
-def predict_lcg(seq: List[int], params: Tuple[int, int, int], forward: int, backward: int) -> Tuple[List[int], List[int]]:
-  a, c, m = params
-  current = seq[-1]
-  forward_values = []
-  for _ in range(forward):
-    current = (a * current + c) % m
-    forward_values.append(current)
-  backward_values = []
-  if backward:
-    inv_a = mod_inverse(a, m)
-    if inv_a is None:
-      raise ValueError('Cannot reverse this generator: multiplier has no modular inverse.')
-    current = seq[0]
-    for _ in range(backward):
-      current = (inv_a * ((current - c) % m)) % m
-      backward_values.append(current)
-  return forward_values, backward_values
+def analysis_to_result(label: str, analysis: AnalysisResult) -> Result:
+  forward_text = format_values(analysis.forward)
+  generated_text = format_values(analysis.generated)
+  if forward_text == '—' and generated_text != '—':
+    forward_text = generated_text
+  return Result(
+    algorithm=label,
+    parameters=f'{label}: {analysis.parameters}',
+    forward=forward_text,
+    backward=format_values(analysis.backward),
+    generated=generated_text,
+  )
 
 
-def infer_additive(seq: List[int]) -> int:
-  if len(seq) < 2:
-    raise ValueError('Need at least two values to infer additive step.')
-  step = seq[1] - seq[0]
-  for i in range(1, len(seq) - 1):
-    if seq[i + 1] - seq[i] != step:
-      raise ValueError('Sequence is not consistent with a single additive step.')
-  return step
+def load_sample_defaults(form_data: dict, algorithm: AlgorithmHandler) -> None:
+  sample = algorithm.sample or {}
+  if algorithm.supports_detection and 'sequence' in sample:
+    sequence_values = sample.get('sequence', [])
+    form_data['sequence'] = ', '.join(_value_to_string(value) for value in sequence_values)
+    form_data['forward'] = sample.get('forward', form_data.get('forward', 5))
+    form_data['backward'] = sample.get('backward', form_data.get('backward', 0))
+  else:
+    seed_values = sample.get('seed')
+    if isinstance(seed_values, (list, tuple)):
+      form_data['sequence'] = ', '.join(_value_to_string(value) for value in seed_values)
+    elif seed_values is None:
+      form_data['sequence'] = ''
+    else:
+      form_data['sequence'] = _value_to_string(seed_values)
+    form_data['forward'] = sample.get('count', form_data.get('forward', 10))
+    form_data['backward'] = 0
 
 
-def predict_additive(seq: List[int], step: int, forward: int, backward: int) -> Tuple[List[int], List[int]]:
-  current = seq[-1]
-  forward_values = []
-  for _ in range(forward):
-    current += step
-    forward_values.append(current)
-  current = seq[0]
-  backward_values = []
-  for _ in range(backward):
-    current -= step
-    backward_values.append(current)
-  return forward_values, backward_values
+def attempt_auto_detection(sequence: List[Number], forward: int, backward: int) -> Tuple[AnalysisResult, AlgorithmHandler]:
+  errors: List[str] = []
+  for algorithm in DETECTABLE_ALGORITHMS:
+    try:
+      analysis = algorithm.analyzer(sequence, forward, backward)
+      return analysis, algorithm
+    except Exception as exc:  # noqa: BLE001
+      errors.append(f"{algorithm.label}: {exc}")
+  joined = ' | '.join(errors)
+  message = 'Unable to match sequence to a supported algorithm.'
+  if joined:
+    message = f'{message} Details: {joined}'
+  raise ValueError(message)
 
 
-def xorshift32(seed: int, count: int) -> List[int]:
-  state = seed & 0xFFFFFFFF
-  output = []
-  for _ in range(count):
-    state ^= (state << 13) & 0xFFFFFFFF
-    state ^= (state >> 17) & 0xFFFFFFFF
-    state ^= (state << 5) & 0xFFFFFFFF
-    state &= 0xFFFFFFFF
-    output.append(state)
-  return output
+def render_page(form_data: dict, result: Result) -> str:
+  return TEMPLATE.render(
+    sequence=form_data.get('sequence', ''),
+    forward=form_data.get('forward', 5),
+    backward=form_data.get('backward', 0),
+    mode=form_data.get('mode', 'auto'),
+    result=result,
+    algorithm_groups=ALGORITHM_GROUPS,
+  )
 
 
-class MT19937:
-  def __init__(self, seed: int) -> None:
-    self.index = 624
-    self.mt = [0] * 624
-    self.mt[0] = seed & 0xFFFFFFFF
-    for i in range(1, 624):
-      prev = self.mt[i - 1]
-      self.mt[i] = (0x6C078965 * (prev ^ (prev >> 30)) + i) & 0xFFFFFFFF
+@app.route('/', methods=['GET', 'POST'])
+def index():
+  form_data = {
+    'sequence': ', '.join(_value_to_string(value) for value in DEFAULT_ALGORITHM.sample['sequence']),
+    'forward': DEFAULT_ALGORITHM.sample.get('forward', 5),
+    'backward': DEFAULT_ALGORITHM.sample.get('backward', 5),
+    'mode': 'auto',
+  }
+  result = Result()
 
-  def extract_number(self) -> int:
-    if self.index >= 624:
-      self.twist()
-    y = self.mt[self.index]
-    y ^= y >> 11
-    y ^= (y << 7) & 0x9D2C5680
-    y ^= (y << 15) & 0xEFC60000
-    y ^= y >> 18
-    self.index += 1
-    return y & 0xFFFFFFFF
+  if request.method == 'GET':
+    return render_page(form_data, result)
 
-  def twist(self) -> None:
-    upper_mask = 0x80000000
-    lower_mask = 0x7FFFFFFF
-    for i in range(624):
-      y = (self.mt[i] & upper_mask) + (self.mt[(i + 1) % 624] & lower_mask)
-      self.mt[i] = self.mt[(i + 397) % 624] ^ (y >> 1)
-      if y % 2:
-        self.mt[i] ^= 0x9908B0DF
-    self.index = 0
+  form_data['sequence'] = request.form.get('sequence', form_data['sequence'])
+  form_data['forward'] = request.form.get('forward', form_data['forward'])
+  form_data['backward'] = request.form.get('backward', form_data['backward'])
+  form_data['mode'] = request.form.get('mode', form_data['mode'])
 
+  selected_key = form_data['mode']
+  selected_algorithm = ALGORITHM_MAP.get(selected_key, DEFAULT_ALGORITHM)
 
-def mt19937_sequence(seed: int, count: int) -> List[int]:
-  mt = MT19937(seed & 0xFFFFFFFF)
-  return [mt.extract_number() for _ in range(count)]
+  if request.form.get('load_sample'):
+    load_sample_defaults(form_data, selected_algorithm)
+    return render_page(form_data, result)
+
+  try:
+    forward = max(0, int(form_data['forward'] or 0))
+    backward = max(0, int(form_data['backward'] or 0))
+  except ValueError:
+    result.error = 'Forward and backward counts must be integers.'
+    return render_page(form_data, result)
+
+  form_data['forward'] = forward
+  form_data['backward'] = backward
+
+  sequence = parse_sequence(form_data['sequence'])
+
+  try:
+    if selected_key == 'auto':
+      if not sequence:
+        raise ValueError('Please provide at least one number to analyze.')
+      analysis, detected_algorithm = attempt_auto_detection(sequence, forward, backward)
+      result = analysis_to_result(detected_algorithm.label, analysis)
+    else:
+      algorithm = ALGORITHM_MAP.get(selected_key)
+      if algorithm is None:
+        raise ValueError('Unknown algorithm requested.')
+      if algorithm.supports_detection and algorithm.analyzer:
+        if not sequence:
+          raise ValueError('Please provide at least one number to analyze.')
+        analysis = algorithm.analyzer(sequence, forward, backward)
+        result = analysis_to_result(algorithm.label, analysis)
+      else:
+        if algorithm.generator is None:
+          raise ValueError('Generation routine not available for this algorithm.')
+        count = forward or int(algorithm.sample.get('count', 10))
+        form_data['forward'] = count
+        analysis = algorithm.generator(sequence, count)
+        result = analysis_to_result(algorithm.label, analysis)
+        result.backward = '—'
+  except Exception as exc:  # noqa: BLE001
+    result = Result(error=str(exc))
+
+  return render_page(form_data, result)
 
 
 class TemplateWrapper:
@@ -223,104 +206,6 @@ class TemplateWrapper:
 
     template = Template(self.text)
     return template.render(**context)
-
-
-def render_page(form_data: dict, result: Result) -> str:
-  return TEMPLATE.render(
-    sequence=form_data.get('sequence', ''),
-    forward=form_data.get('forward', 5),
-    backward=form_data.get('backward', 5),
-    mode=form_data.get('mode', 'auto'),
-    result=result,
-  )
-
-
-@app.route('/', methods=['GET', 'POST'])
-def index():
-  form_data = {
-    'sequence': ', '.join(map(str, SAMPLE_DATA['lcg']['sequence'])),
-    'forward': SAMPLE_DATA['lcg']['forward'],
-    'backward': SAMPLE_DATA['lcg']['backward'],
-    'mode': 'auto',
-  }
-  result = Result()
-
-  if request.method == 'POST':
-    form_data['sequence'] = request.form.get('sequence', '')
-    form_data['forward'] = request.form.get('forward', form_data['forward'])
-    form_data['backward'] = request.form.get('backward', form_data['backward'])
-    form_data['mode'] = request.form.get('mode', form_data['mode'])
-
-    if request.form.get('load_sample'):
-      mode = form_data['mode']
-      if mode in {'lcg', 'auto'}:
-        sample = SAMPLE_DATA['lcg']
-        form_data['sequence'] = ', '.join(map(str, sample['sequence']))
-        form_data['forward'] = sample['forward']
-        form_data['backward'] = sample['backward']
-      elif mode == 'additive':
-        sample = SAMPLE_DATA['additive']
-        form_data['sequence'] = ', '.join(map(str, sample['sequence']))
-        form_data['forward'] = sample['forward']
-        form_data['backward'] = sample['backward']
-      else:
-        sample = SAMPLE_DATA[mode]
-        form_data['sequence'] = (
-          f"0x{sample['seed']:x}" if mode == 'xorshift' else str(sample['seed'])
-        )
-        form_data['forward'] = sample['count']
-        form_data['backward'] = 0
-      return render_page(form_data, result)
-
-    try:
-      forward = max(0, int(form_data['forward'] or 0))
-      backward = max(0, int(form_data['backward'] or 0))
-    except ValueError:
-      result.error = 'Forward and backward counts must be integers.'
-      return render_page(form_data, result)
-
-    mode = form_data['mode']
-    sequence = parse_sequence(form_data['sequence'])
-
-    try:
-      if mode in {'xorshift', 'mt19937'}:
-        seed = sequence[0] if sequence else SAMPLE_DATA[mode]['seed']
-        count = forward or SAMPLE_DATA[mode]['count']
-        generated = (
-          xorshift32(seed, count)
-          if mode == 'xorshift'
-          else mt19937_sequence(seed, count)
-        )
-        result.parameters = f'Seed: {seed & 0xFFFFFFFF}'
-        result.generated = ', '.join(str(n) for n in generated)
-        result.forward = '—'
-        result.backward = '—'
-      else:
-        if not sequence:
-          raise ValueError('Please provide at least one number.')
-        if mode == 'lcg':
-          params = infer_lcg(sequence)
-          forward_vals, backward_vals = predict_lcg(sequence, params, forward, backward)
-          result.parameters = f'a = {params[0]}, c = {params[1]}, m = {params[2]}'
-        elif mode == 'additive':
-          step = infer_additive(sequence)
-          forward_vals, backward_vals = predict_additive(sequence, step, forward, backward)
-          result.parameters = f'k = {step}'
-        else:
-          try:
-            params = infer_lcg(sequence)
-            forward_vals, backward_vals = predict_lcg(sequence, params, forward, backward)
-            result.parameters = f'Detected LCG: a = {params[0]}, c = {params[1]}, m = {params[2]}'
-          except ValueError as first_error:
-            step = infer_additive(sequence)
-            forward_vals, backward_vals = predict_additive(sequence, step, forward, backward)
-            result.parameters = f'Detected additive sequence: k = {step} (LCG error: {first_error})'
-        result.forward = ', '.join(str(n) for n in forward_vals) if forward_vals else '—'
-        result.backward = ', '.join(str(n) for n in backward_vals) if backward_vals else '—'
-    except Exception as exc:  # noqa: BLE001
-      result.error = str(exc)
-
-  return render_page(form_data, result)
 
 
 TEMPLATE = TemplateWrapper(
@@ -398,46 +283,55 @@ label {
   color: var(--muted);
 }
 textarea, input, select {
-  background: rgba(15, 23, 42, 0.75);
+  background: rgba(15, 23, 42, 0.7);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 10px;
+  padding: 0.7rem;
   color: var(--text);
-  border: 1px solid rgba(148, 163, 184, 0.2);
-  border-radius: 12px;
-  padding: 0.75rem;
   font-size: 1rem;
+  font-family: inherit;
   transition: border-color 0.2s ease, box-shadow 0.2s ease;
 }
 textarea:focus, input:focus, select:focus {
   outline: none;
-  border-color: rgba(99, 102, 241, 0.6);
-  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.25);
+  border-color: rgba(99, 102, 241, 0.8);
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.25);
 }
-textarea { min-height: 120px; resize: vertical; }
-.options-grid {
+.options {
   display: grid;
   gap: 1rem;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  margin-bottom: 1.5rem;
+  margin-top: 1rem;
 }
-.button-row { display: flex; flex-wrap: wrap; gap: 0.8rem; }
+.options-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 1rem;
+}
+.button-row {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
 button {
-  border: none;
-  border-radius: 12px;
-  padding: 0.9rem 1.5rem;
-  font-size: 1rem;
-  font-weight: 600;
   cursor: pointer;
-  transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.3s ease;
-  background: rgba(148, 163, 184, 0.15);
-  color: var(--text);
+  border-radius: 12px;
+  padding: 0.75rem 1.4rem;
+  border: none;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  transition: transform 0.18s ease, box-shadow 0.18s ease;
 }
 button.primary {
   background: linear-gradient(135deg, var(--accent-start), var(--accent-end));
-  box-shadow: 0 10px 25px rgba(99, 102, 241, 0.4);
+  color: white;
+  box-shadow: 0 12px 25px rgba(99, 102, 241, 0.35);
 }
-button:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.45);
+button:not(.primary) {
+  background: rgba(15, 23, 42, 0.7);
+  color: var(--text);
+  border: 1px solid rgba(148, 163, 184, 0.2);
 }
+button:hover { transform: translateY(-1px); }
 button:active { transform: translateY(0); }
 .results-section { margin-bottom: 1.3rem; }
 .results-section h3 { margin-bottom: 0.4rem; }
@@ -465,17 +359,17 @@ pre {
     <header class=\"app-header\">
       <div class=\"badge\">DevSkits916</div>
       <h1>RNG Analyzer</h1>
-      <p class=\"subtitle\">Infer simple RNG parameters and explore sample generators.</p>
+      <p class=\"subtitle\">Detect or generate classic RNG families, from congruential to cryptographic and chaotic systems.</p>
     </header>
 
     <form method=\"post\" class=\"card\">
       <h2>Input</h2>
-      <label for=\"sequence\">Observed sequence (comma, space, or newline separated; hex like 0x123 allowed)</label>
+      <label for=\"sequence\">Observed sequence or seed material (comma, space, or newline separated; hex like 0x123 allowed)</label>
       <textarea id=\"sequence\" name=\"sequence\" rows=\"6\">{{ sequence }}</textarea>
       <section class=\"options\">
         <h2>Options</h2>
         <div class=\"options-grid\">
-          <label>Forward predictions
+          <label>Forward predictions / count
             <input type=\"number\" name=\"forward\" min=\"0\" value=\"{{ forward }}\" />
           </label>
           <label>Backward predictions
@@ -484,34 +378,38 @@ pre {
           <label>Algorithm mode
             <select name=\"mode\">
               <option value=\"auto\" {% if mode == 'auto' %}selected{% endif %}>Auto Detect / Infer</option>
-              <option value=\"lcg\" {% if mode == 'lcg' %}selected{% endif %}>LCG (manual analyze)</option>
-              <option value=\"additive\" {% if mode == 'additive' %}selected{% endif %}>Additive (manual analyze)</option>
-              <option value=\"xorshift\" {% if mode == 'xorshift' %}selected{% endif %}>Xorshift demo</option>
-              <option value=\"mt19937\" {% if mode == 'mt19937' %}selected{% endif %}>MT19937 demo</option>
+              {% for category, items in algorithm_groups %}
+                <optgroup label=\"{{ category }}\">
+                  {% for entry in items %}
+                    <option value=\"{{ entry.key }}\" {% if mode == entry.key %}selected{% endif %}>{{ entry.label }}</option>
+                  {% endfor %}
+                </optgroup>
+              {% endfor %}
             </select>
           </label>
         </div>
         <div class=\"button-row\">
           <button type=\"submit\" class=\"primary\">Analyze / Predict</button>
-          <button type=\"submit\" name=\"load_sample\" value=\"1\">Load Sample Sequence for This Algorithm</button>
+          <button type=\"submit\" name=\"load_sample\" value=\"1\">Load Sample Configuration</button>
         </div>
       </section>
     </form>
 
     <section class=\"card\" id=\"results-card\">
       <h2>Results</h2>
+      {% if result.algorithm %}<p class=\"hint\">Active algorithm: {{ result.algorithm }}</p>{% endif %}
       <div class=\"results-section\">
         <h3>Parameters</h3>
         <pre id=\"parameters-output\">{{ result.parameters }}</pre>
       </div>
       <div class=\"results-section\">
         <h3>Forward predictions</h3>
-        <p class=\"hint\">Predicted states after your last provided number.</p>
+        <p class=\"hint\">Predicted or generated states after your last provided number.</p>
         <pre id=\"forward-output\">{{ result.forward }}</pre>
       </div>
       <div class=\"results-section\">
         <h3>Backward predictions</h3>
-        <p class=\"hint\">States before your first provided number (starting with immediately previous).</p>
+        <p class=\"hint\">States before your first provided number (where supported).</p>
         <pre id=\"backward-output\">{{ result.backward }}</pre>
       </div>
       <div class=\"results-section\">
