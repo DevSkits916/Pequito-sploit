@@ -1,9 +1,30 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+import json
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple, Union
 
 from flask import Flask, request
+
+try:
+  from rng_algorithms import (
+    ALGORITHMS,
+    ALGORITHM_MAP,
+    DETECTABLE_ALGORITHMS,
+    AlgorithmHandler,
+    AnalysisResult,
+  )
+except ModuleNotFoundError:  # pragma: no cover - fallback for package execution
+  from server.rng_algorithms import (  # type: ignore[import-not-found]
+    ALGORITHMS,
+    ALGORITHM_MAP,
+    DETECTABLE_ALGORITHMS,
+    AlgorithmHandler,
+    AnalysisResult,
+  )
+
+Number = Union[int, float]
 
 app = Flask(__name__)
 
@@ -15,203 +36,188 @@ class Result:
   backward: str = '—'
   generated: str = '—'
   error: Optional[str] = None
+  algorithm: Optional[str] = None
 
 
-SAMPLE_DATA = {
-  'lcg': {
-    'label': 'LCG demo',
-    'sequence': [
-      1250496027, 1116302264, 1000676753, 1668674806, 908095735,
-      915748896, 1544819687, 79942767, 1683185398, 823564440,
-    ],
-    'forward': 5,
-    'backward': 5,
-  },
-  'additive': {
-    'label': 'Additive demo',
-    'sequence': [1000, 1037, 1074, 1111, 1148, 1185, 1222, 1259, 1296, 1333],
-    'forward': 5,
-    'backward': 5,
-  },
-  'xorshift': {'label': 'Xorshift32 demo', 'seed': 0x12345678, 'count': 10},
-  'mt19937': {'label': 'MT19937 demo', 'seed': 5489, 'count': 10},
+_GROUPED: OrderedDict[str, List[AlgorithmHandler]] = OrderedDict()
+for algorithm in ALGORITHMS:
+  _GROUPED.setdefault(algorithm.category, []).append(algorithm)
+ALGORITHM_GROUPS: List[Tuple[str, List[AlgorithmHandler]]] = list(_GROUPED.items())
+DEFAULT_ALGORITHM = ALGORITHM_MAP['lcg']
+ALGORITHM_DETAILS = {
+  handler.key: {
+    'label': handler.label,
+    'category': handler.category,
+    'supports_detection': handler.supports_detection,
+    'description': handler.description,
+  }
+  for handler in ALGORITHMS
 }
 
 
-def gcd(a: int, b: int) -> int:
-  a = abs(a)
-  b = abs(b)
-  while b:
-    a, b = b, a % b
-  return a
-
-
-def egcd(a: int, b: int) -> Tuple[int, int, int]:
-  if b == 0:
-    return a, 1, 0
-  g, x1, y1 = egcd(b, a % b)
-  x = y1
-  y = x1 - (a // b) * y1
-  return g, x, y
-
-
-def mod_inverse(a: int, m: int) -> Optional[int]:
-  a = (a % m + m) % m
-  g, x, _ = egcd(a, m)
-  if g != 1:
-    return None
-  return (x % m + m) % m
-
-
-def parse_sequence(raw: str) -> List[int]:
+def parse_sequence(raw: str) -> List[Number]:
   if not raw:
     return []
   clean = raw.replace('\n', ' ').replace(',', ' ')
   tokens = [token.strip() for token in clean.split()]
-  result = []
+  result: List[Number] = []
   for token in tokens:
     if not token:
       continue
-    base = 16 if token.lower().startswith('0x') else 10
     try:
-      value = int(token, base=base)
+      value = int(token, 0)
+      result.append(value)
+      continue
+    except ValueError:
+      pass
+    try:
+      value = float(token)
     except ValueError:
       continue
     result.append(value)
   return result
 
 
-def infer_modulus(seq: List[int]) -> int:
-  values = []
-  for i in range(len(seq) - 3):
-    x0, x1, x2, x3 = seq[i : i + 4]
-    t = (x3 - x2) * (x1 - x0) - (x2 - x1) * (x2 - x1)
-    if t:
-      values.append(abs(t))
-  if not values:
-    raise ValueError('Unable to infer modulus: no non-zero determinant differences.')
-  modulus = values[0]
-  for value in values[1:]:
-    modulus = gcd(modulus, value)
-  return modulus
+def _value_to_string(value: Number) -> str:
+  if isinstance(value, float):
+    return f'{value:.12g}'
+  return str(value)
 
 
-def infer_lcg(seq: List[int]) -> Tuple[int, int, int]:
-  if len(seq) < 4:
-    raise ValueError('Need at least four values to infer an LCG.')
-  modulus = infer_modulus(seq)
-  if modulus <= 0:
-    raise ValueError('Inferred modulus is not positive.')
-  multiplier = increment = None
-  for i in range(len(seq) - 2):
-    x0, x1, x2 = seq[i : i + 3]
-    delta = (x1 - x0) % modulus
-    if delta == 0:
-      continue
-    inv = mod_inverse(delta, modulus)
-    if inv is None:
-      continue
-    multiplier = ((x2 - x1) % modulus) * inv % modulus
-    increment = (x1 - multiplier * x0) % modulus
-    break
-  if multiplier is None or increment is None:
-    raise ValueError('Unable to determine multiplier and increment.')
-  for i in range(len(seq) - 1):
-    predicted = (multiplier * seq[i] + increment) % modulus
-    if predicted != seq[i + 1] % modulus:
-      raise ValueError('Inferred parameters do not reproduce the provided sequence.')
-  return multiplier, increment, modulus
+def format_values(values: Iterable[Number]) -> str:
+  materialised = list(values)
+  if not materialised:
+    return '—'
+  return ', '.join(_value_to_string(value) for value in materialised)
 
 
-def predict_lcg(seq: List[int], params: Tuple[int, int, int], forward: int, backward: int) -> Tuple[List[int], List[int]]:
-  a, c, m = params
-  current = seq[-1]
-  forward_values = []
-  for _ in range(forward):
-    current = (a * current + c) % m
-    forward_values.append(current)
-  backward_values = []
-  if backward:
-    inv_a = mod_inverse(a, m)
-    if inv_a is None:
-      raise ValueError('Cannot reverse this generator: multiplier has no modular inverse.')
-    current = seq[0]
-    for _ in range(backward):
-      current = (inv_a * ((current - c) % m)) % m
-      backward_values.append(current)
-  return forward_values, backward_values
+def analysis_to_result(label: str, analysis: AnalysisResult) -> Result:
+  forward_text = format_values(analysis.forward)
+  generated_text = format_values(analysis.generated)
+  if forward_text == '—' and generated_text != '—':
+    forward_text = generated_text
+  return Result(
+    algorithm=label,
+    parameters=f'{label}: {analysis.parameters}',
+    forward=forward_text,
+    backward=format_values(analysis.backward),
+    generated=generated_text,
+  )
 
 
-def infer_additive(seq: List[int]) -> int:
-  if len(seq) < 2:
-    raise ValueError('Need at least two values to infer additive step.')
-  step = seq[1] - seq[0]
-  for i in range(1, len(seq) - 1):
-    if seq[i + 1] - seq[i] != step:
-      raise ValueError('Sequence is not consistent with a single additive step.')
-  return step
+def load_sample_defaults(form_data: dict, algorithm: AlgorithmHandler) -> None:
+  sample = algorithm.sample or {}
+  if algorithm.supports_detection and 'sequence' in sample:
+    sequence_values = sample.get('sequence', [])
+    form_data['sequence'] = ', '.join(_value_to_string(value) for value in sequence_values)
+    form_data['forward'] = sample.get('forward', form_data.get('forward', 5))
+    form_data['backward'] = sample.get('backward', form_data.get('backward', 0))
+  else:
+    seed_values = sample.get('seed')
+    if isinstance(seed_values, (list, tuple)):
+      form_data['sequence'] = ', '.join(_value_to_string(value) for value in seed_values)
+    elif seed_values is None:
+      form_data['sequence'] = ''
+    else:
+      form_data['sequence'] = _value_to_string(seed_values)
+    form_data['forward'] = sample.get('count', form_data.get('forward', 10))
+    form_data['backward'] = 0
 
 
-def predict_additive(seq: List[int], step: int, forward: int, backward: int) -> Tuple[List[int], List[int]]:
-  current = seq[-1]
-  forward_values = []
-  for _ in range(forward):
-    current += step
-    forward_values.append(current)
-  current = seq[0]
-  backward_values = []
-  for _ in range(backward):
-    current -= step
-    backward_values.append(current)
-  return forward_values, backward_values
+def attempt_auto_detection(sequence: List[Number], forward: int, backward: int) -> Tuple[AnalysisResult, AlgorithmHandler]:
+  errors: List[str] = []
+  for algorithm in DETECTABLE_ALGORITHMS:
+    try:
+      analysis = algorithm.analyzer(sequence, forward, backward)
+      return analysis, algorithm
+    except Exception as exc:  # noqa: BLE001
+      errors.append(f"{algorithm.label}: {exc}")
+  joined = ' | '.join(errors)
+  message = 'Unable to match sequence to a supported algorithm.'
+  if joined:
+    message = f'{message} Details: {joined}'
+  raise ValueError(message)
 
 
-def xorshift32(seed: int, count: int) -> List[int]:
-  state = seed & 0xFFFFFFFF
-  output = []
-  for _ in range(count):
-    state ^= (state << 13) & 0xFFFFFFFF
-    state ^= (state >> 17) & 0xFFFFFFFF
-    state ^= (state << 5) & 0xFFFFFFFF
-    state &= 0xFFFFFFFF
-    output.append(state)
-  return output
+def render_page(form_data: dict, result: Result) -> str:
+  return TEMPLATE.render(
+    sequence=form_data.get('sequence', ''),
+    forward=form_data.get('forward', 5),
+    backward=form_data.get('backward', 0),
+    mode=form_data.get('mode', 'auto'),
+    result=result,
+    algorithm_groups=ALGORITHM_GROUPS,
+    algorithm_details_json=json.dumps(ALGORITHM_DETAILS),
+    detectable_count=len(DETECTABLE_ALGORITHMS),
+    total_count=len(ALGORITHMS),
+    input_count=len(parse_sequence(str(form_data.get('sequence', '')))),
+  )
 
 
-class MT19937:
-  def __init__(self, seed: int) -> None:
-    self.index = 624
-    self.mt = [0] * 624
-    self.mt[0] = seed & 0xFFFFFFFF
-    for i in range(1, 624):
-      prev = self.mt[i - 1]
-      self.mt[i] = (0x6C078965 * (prev ^ (prev >> 30)) + i) & 0xFFFFFFFF
+@app.route('/', methods=['GET', 'POST'])
+def index():
+  form_data = {
+    'sequence': ', '.join(_value_to_string(value) for value in DEFAULT_ALGORITHM.sample['sequence']),
+    'forward': DEFAULT_ALGORITHM.sample.get('forward', 5),
+    'backward': DEFAULT_ALGORITHM.sample.get('backward', 5),
+    'mode': 'auto',
+  }
+  result = Result()
 
-  def extract_number(self) -> int:
-    if self.index >= 624:
-      self.twist()
-    y = self.mt[self.index]
-    y ^= y >> 11
-    y ^= (y << 7) & 0x9D2C5680
-    y ^= (y << 15) & 0xEFC60000
-    y ^= y >> 18
-    self.index += 1
-    return y & 0xFFFFFFFF
+  if request.method == 'GET':
+    return render_page(form_data, result)
 
-  def twist(self) -> None:
-    upper_mask = 0x80000000
-    lower_mask = 0x7FFFFFFF
-    for i in range(624):
-      y = (self.mt[i] & upper_mask) + (self.mt[(i + 1) % 624] & lower_mask)
-      self.mt[i] = self.mt[(i + 397) % 624] ^ (y >> 1)
-      if y % 2:
-        self.mt[i] ^= 0x9908B0DF
-    self.index = 0
+  form_data['sequence'] = request.form.get('sequence', form_data['sequence'])
+  form_data['forward'] = request.form.get('forward', form_data['forward'])
+  form_data['backward'] = request.form.get('backward', form_data['backward'])
+  form_data['mode'] = request.form.get('mode', form_data['mode'])
 
+  selected_key = form_data['mode']
+  selected_algorithm = ALGORITHM_MAP.get(selected_key, DEFAULT_ALGORITHM)
 
-def mt19937_sequence(seed: int, count: int) -> List[int]:
-  mt = MT19937(seed & 0xFFFFFFFF)
-  return [mt.extract_number() for _ in range(count)]
+  if request.form.get('load_sample'):
+    load_sample_defaults(form_data, selected_algorithm)
+    return render_page(form_data, result)
+
+  try:
+    forward = max(0, int(form_data['forward'] or 0))
+    backward = max(0, int(form_data['backward'] or 0))
+  except ValueError:
+    result.error = 'Forward and backward counts must be integers.'
+    return render_page(form_data, result)
+
+  form_data['forward'] = forward
+  form_data['backward'] = backward
+
+  sequence = parse_sequence(form_data['sequence'])
+
+  try:
+    if selected_key == 'auto':
+      if not sequence:
+        raise ValueError('Please provide at least one number to analyze.')
+      analysis, detected_algorithm = attempt_auto_detection(sequence, forward, backward)
+      result = analysis_to_result(detected_algorithm.label, analysis)
+    else:
+      algorithm = ALGORITHM_MAP.get(selected_key)
+      if algorithm is None:
+        raise ValueError('Unknown algorithm requested.')
+      if algorithm.supports_detection and algorithm.analyzer:
+        if not sequence:
+          raise ValueError('Please provide at least one number to analyze.')
+        analysis = algorithm.analyzer(sequence, forward, backward)
+        result = analysis_to_result(algorithm.label, analysis)
+      else:
+        if algorithm.generator is None:
+          raise ValueError('Generation routine not available for this algorithm.')
+        count = forward or int(algorithm.sample.get('count', 10))
+        form_data['forward'] = count
+        analysis = algorithm.generator(sequence, count)
+        result = analysis_to_result(algorithm.label, analysis)
+        result.backward = '—'
+  except Exception as exc:  # noqa: BLE001
+    result = Result(error=str(exc))
+
+  return render_page(form_data, result)
 
 
 class TemplateWrapper:
@@ -225,309 +231,576 @@ class TemplateWrapper:
     return template.render(**context)
 
 
-def render_page(form_data: dict, result: Result) -> str:
-  return TEMPLATE.render(
-    sequence=form_data.get('sequence', ''),
-    forward=form_data.get('forward', 5),
-    backward=form_data.get('backward', 5),
-    mode=form_data.get('mode', 'auto'),
-    result=result,
-  )
-
-
-@app.route('/', methods=['GET', 'POST'])
-def index():
-  form_data = {
-    'sequence': ', '.join(map(str, SAMPLE_DATA['lcg']['sequence'])),
-    'forward': SAMPLE_DATA['lcg']['forward'],
-    'backward': SAMPLE_DATA['lcg']['backward'],
-    'mode': 'auto',
-  }
-  result = Result()
-
-  if request.method == 'POST':
-    form_data['sequence'] = request.form.get('sequence', '')
-    form_data['forward'] = request.form.get('forward', form_data['forward'])
-    form_data['backward'] = request.form.get('backward', form_data['backward'])
-    form_data['mode'] = request.form.get('mode', form_data['mode'])
-
-    if request.form.get('load_sample'):
-      mode = form_data['mode']
-      if mode in {'lcg', 'auto'}:
-        sample = SAMPLE_DATA['lcg']
-        form_data['sequence'] = ', '.join(map(str, sample['sequence']))
-        form_data['forward'] = sample['forward']
-        form_data['backward'] = sample['backward']
-      elif mode == 'additive':
-        sample = SAMPLE_DATA['additive']
-        form_data['sequence'] = ', '.join(map(str, sample['sequence']))
-        form_data['forward'] = sample['forward']
-        form_data['backward'] = sample['backward']
-      else:
-        sample = SAMPLE_DATA[mode]
-        form_data['sequence'] = (
-          f"0x{sample['seed']:x}" if mode == 'xorshift' else str(sample['seed'])
-        )
-        form_data['forward'] = sample['count']
-        form_data['backward'] = 0
-      return render_page(form_data, result)
-
-    try:
-      forward = max(0, int(form_data['forward'] or 0))
-      backward = max(0, int(form_data['backward'] or 0))
-    except ValueError:
-      result.error = 'Forward and backward counts must be integers.'
-      return render_page(form_data, result)
-
-    mode = form_data['mode']
-    sequence = parse_sequence(form_data['sequence'])
-
-    try:
-      if mode in {'xorshift', 'mt19937'}:
-        seed = sequence[0] if sequence else SAMPLE_DATA[mode]['seed']
-        count = forward or SAMPLE_DATA[mode]['count']
-        generated = (
-          xorshift32(seed, count)
-          if mode == 'xorshift'
-          else mt19937_sequence(seed, count)
-        )
-        result.parameters = f'Seed: {seed & 0xFFFFFFFF}'
-        result.generated = ', '.join(str(n) for n in generated)
-        result.forward = '—'
-        result.backward = '—'
-      else:
-        if not sequence:
-          raise ValueError('Please provide at least one number.')
-        if mode == 'lcg':
-          params = infer_lcg(sequence)
-          forward_vals, backward_vals = predict_lcg(sequence, params, forward, backward)
-          result.parameters = f'a = {params[0]}, c = {params[1]}, m = {params[2]}'
-        elif mode == 'additive':
-          step = infer_additive(sequence)
-          forward_vals, backward_vals = predict_additive(sequence, step, forward, backward)
-          result.parameters = f'k = {step}'
-        else:
-          try:
-            params = infer_lcg(sequence)
-            forward_vals, backward_vals = predict_lcg(sequence, params, forward, backward)
-            result.parameters = f'Detected LCG: a = {params[0]}, c = {params[1]}, m = {params[2]}'
-          except ValueError as first_error:
-            step = infer_additive(sequence)
-            forward_vals, backward_vals = predict_additive(sequence, step, forward, backward)
-            result.parameters = f'Detected additive sequence: k = {step} (LCG error: {first_error})'
-        result.forward = ', '.join(str(n) for n in forward_vals) if forward_vals else '—'
-        result.backward = ', '.join(str(n) for n in backward_vals) if backward_vals else '—'
-    except Exception as exc:  # noqa: BLE001
-      result.error = str(exc)
-
-  return render_page(form_data, result)
-
-
 TEMPLATE = TemplateWrapper(
-  """
-<!DOCTYPE html>
-<html lang=\"en\">
+  """<!DOCTYPE html>
+<html lang="en">
 <head>
-  <meta charset=\"UTF-8\" />
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>RNG Analyzer</title>
   <style>
 :root {
   color-scheme: dark;
-  --bg: #0f172a;
-  --bg-alt: #1e293b;
+  --bg: #050816;
+  --bg-alt: rgba(15, 23, 42, 0.78);
+  --bg-alt-strong: rgba(15, 23, 42, 0.92);
   --text: #e2e8f0;
   --muted: #94a3b8;
-  --accent-start: #6366f1;
-  --accent-end: #8b5cf6;
+  --accent: #7c3aed;
+  --accent-soft: rgba(124, 58, 237, 0.25);
+  --success: #34d399;
   --error: #f87171;
-  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
 }
-* { box-sizing: border-box; }
+* {
+  box-sizing: border-box;
+}
 body {
   margin: 0;
-  background: radial-gradient(circle at top, rgba(99, 102, 241, 0.18), transparent 55%),
-    radial-gradient(circle at bottom, rgba(139, 92, 246, 0.15), transparent 55%),
-    var(--bg);
-  color: var(--text);
   min-height: 100vh;
+  background: radial-gradient(circle at 20% -10%, rgba(147, 51, 234, 0.38), transparent 55%),
+    radial-gradient(circle at 90% 10%, rgba(14, 116, 144, 0.34), transparent 55%),
+    linear-gradient(180deg, #050816 0%, #0f172a 100%);
+  color: var(--text);
   display: flex;
   justify-content: center;
-  padding: 3rem 1rem 4rem;
+  padding: 3.5rem 1.2rem 4rem;
 }
 .app-shell {
-  width: min(960px, 100%);
+  width: min(1100px, 100%);
   display: grid;
   gap: 1.5rem;
 }
 .app-header {
-  text-align: center;
-  padding: 1.5rem;
-  background: rgba(15, 23, 42, 0.7);
-  border-radius: 16px;
-  border: 1px solid rgba(148, 163, 184, 0.1);
-  backdrop-filter: blur(8px);
-  box-shadow: 0 18px 45px rgba(15, 23, 42, 0.45);
+  background: linear-gradient(135deg, rgba(15, 23, 42, 0.95), rgba(15, 23, 42, 0.65));
+  border-radius: 20px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  padding: 2.1rem 2rem;
+  position: relative;
+  overflow: hidden;
+  box-shadow: 0 25px 65px rgba(2, 6, 23, 0.55);
+}
+.app-header::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at top right, rgba(124, 58, 237, 0.35), transparent 60%);
+  pointer-events: none;
 }
 .badge {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  padding: 0.35rem 0.8rem;
+  gap: 0.4rem;
+  padding: 0.4rem 0.9rem;
   border-radius: 999px;
-  background: linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(139, 92, 246, 0.2));
-  border: 1px solid rgba(99, 102, 241, 0.5);
+  background: rgba(124, 58, 237, 0.18);
+  border: 1px solid rgba(124, 58, 237, 0.45);
   font-weight: 600;
-  letter-spacing: 0.04em;
-  margin-bottom: 0.6rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: #c4b5fd;
+  position: relative;
+  z-index: 1;
 }
-.app-header h1 { margin: 0; font-size: clamp(2rem, 4vw, 2.7rem); }
-.subtitle { margin-top: 0.4rem; color: var(--muted); }
-.card {
+.app-header h1 {
+  margin: 0.4rem 0 0;
+  font-size: clamp(2.4rem, 5vw, 3.1rem);
+  letter-spacing: -0.015em;
+  position: relative;
+  z-index: 1;
+}
+.subtitle {
+  margin: 0.6rem 0 0;
+  color: var(--muted);
+  font-size: 1.02rem;
+  max-width: 60ch;
+  position: relative;
+  z-index: 1;
+}
+.status-card {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  align-items: stretch;
   background: var(--bg-alt);
-  border-radius: 16px;
+  border-radius: 18px;
+  padding: 1.4rem 1.8rem;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  box-shadow: 0 20px 55px rgba(15, 23, 42, 0.45);
+}
+.status-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.status-label {
+  font-size: 0.82rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(226, 232, 240, 0.55);
+}
+.status-value {
+  font-size: 1.35rem;
+  font-weight: 600;
+}
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  background: rgba(52, 211, 153, 0.16);
+  border: 1px solid rgba(52, 211, 153, 0.45);
+  color: #6ee7b7;
+  font-size: 0.82rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.layout-grid {
+  display: grid;
+  gap: 1.5rem;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  align-items: start;
+}
+.card {
+  background: var(--bg-alt-strong);
+  border-radius: 18px;
   padding: 1.8rem;
   border: 1px solid rgba(148, 163, 184, 0.18);
-  box-shadow: 0 14px 35px rgba(15, 23, 42, 0.5);
+  box-shadow: 0 18px 45px rgba(2, 6, 23, 0.55);
 }
-.card h2 { margin-top: 0; font-size: 1.3rem; }
-label {
-  display: grid;
-  gap: 0.4rem;
-  font-weight: 600;
+.card h2 {
+  margin: 0 0 1rem;
+  font-size: 1.35rem;
+}
+.field-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.88rem;
   color: var(--muted);
+  margin-bottom: 0.4rem;
 }
-textarea, input, select {
-  background: rgba(15, 23, 42, 0.75);
-  color: var(--text);
-  border: 1px solid rgba(148, 163, 184, 0.2);
+textarea,
+input,
+select {
+  width: 100%;
+  background: rgba(10, 16, 32, 0.8);
+  border: 1px solid rgba(148, 163, 184, 0.22);
   border-radius: 12px;
-  padding: 0.75rem;
+  padding: 0.75rem 0.9rem;
+  color: var(--text);
   font-size: 1rem;
-  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  font-family: inherit;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
 }
-textarea:focus, input:focus, select:focus {
+textarea:focus,
+input:focus,
+select:focus {
   outline: none;
-  border-color: rgba(99, 102, 241, 0.6);
-  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.25);
+  border-color: rgba(124, 58, 237, 0.7);
+  box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.2);
+  transform: translateY(-1px);
 }
-textarea { min-height: 120px; resize: vertical; }
+textarea {
+  min-height: 180px;
+  resize: vertical;
+}
 .options-grid {
   display: grid;
   gap: 1rem;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  margin-bottom: 1.5rem;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  margin-top: 1.2rem;
 }
-.button-row { display: flex; flex-wrap: wrap; gap: 0.8rem; }
+.button-row {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-top: 1.4rem;
+}
 button {
-  border: none;
-  border-radius: 12px;
-  padding: 0.9rem 1.5rem;
-  font-size: 1rem;
-  font-weight: 600;
   cursor: pointer;
-  transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.3s ease;
-  background: rgba(148, 163, 184, 0.15);
-  color: var(--text);
+  border-radius: 12px;
+  padding: 0.8rem 1.6rem;
+  border: none;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  transition: transform 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
 }
 button.primary {
-  background: linear-gradient(135deg, var(--accent-start), var(--accent-end));
-  box-shadow: 0 10px 25px rgba(99, 102, 241, 0.4);
+  background: linear-gradient(135deg, rgba(124, 58, 237, 0.95), rgba(79, 70, 229, 0.95));
+  color: white;
+  box-shadow: 0 18px 35px rgba(76, 29, 149, 0.45);
+}
+button:not(.primary) {
+  background: rgba(15, 23, 42, 0.75);
+  color: var(--text);
+  border: 1px solid rgba(148, 163, 184, 0.22);
 }
 button:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.45);
+  transform: translateY(-2px);
 }
-button:active { transform: translateY(0); }
-.results-section { margin-bottom: 1.3rem; }
-.results-section h3 { margin-bottom: 0.4rem; }
-.hint { margin: 0; color: var(--muted); font-size: 0.9rem; }
+button:active {
+  transform: translateY(0);
+}
+.info-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 1.2rem;
+}
+.algorithm-list {
+  display: grid;
+  gap: 0.6rem;
+  max-height: 280px;
+  overflow-y: auto;
+  padding-right: 0.2rem;
+}
+.algorithm-group {
+  display: grid;
+  gap: 0.45rem;
+}
+.algorithm-group-title {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: rgba(226, 232, 240, 0.45);
+}
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+.algo-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.9);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  color: var(--text);
+  font-size: 0.78rem;
+  transition: border 0.18s ease, background 0.18s ease, color 0.18s ease;
+}
+.algo-chip[data-active='true'] {
+  border-color: rgba(124, 58, 237, 0.7);
+  background: rgba(124, 58, 237, 0.2);
+  color: #c4b5fd;
+}
+.algorithm-meta {
+  display: grid;
+  gap: 0.65rem;
+  padding: 1rem 1.1rem;
+  border-radius: 16px;
+  background: rgba(15, 23, 42, 0.65);
+  border: 1px solid rgba(124, 58, 237, 0.2);
+}
+.algorithm-meta h3 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+.algorithm-meta p {
+  margin: 0;
+  color: rgba(226, 232, 240, 0.7);
+  line-height: 1.5;
+}
+.meta-badges {
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+.meta-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.3rem 0.7rem;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  font-size: 0.75rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: rgba(226, 232, 240, 0.7);
+}
+.results-card {
+  display: grid;
+  gap: 1.4rem;
+}
+.results-headline {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.8rem;
+}
+.results-headline h2 {
+  margin: 0;
+}
+.hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+.results-section {
+  display: grid;
+  gap: 0.45rem;
+}
 pre {
-  background: rgba(15, 23, 42, 0.7);
-  border-radius: 12px;
-  padding: 0.9rem;
-  overflow-x: auto;
-  border: 1px solid rgba(148, 163, 184, 0.15);
+  margin: 0;
+  background: rgba(10, 16, 32, 0.82);
+  border-radius: 14px;
+  padding: 1rem 1.1rem;
+  border: 1px solid rgba(148, 163, 184, 0.18);
   font-size: 0.95rem;
   font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  overflow-x: auto;
 }
-.hidden { display: none; }
-#error-card { border: 1px solid rgba(248, 113, 113, 0.5); }
-#error-output { color: var(--error); }
+.hidden {
+  display: none;
+}
+#error-card {
+  border: 1px solid rgba(248, 113, 113, 0.45);
+}
+#error-output {
+  color: var(--error);
+}
+.app-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.85rem;
+  color: rgba(226, 232, 240, 0.55);
+  padding: 0 0.4rem;
+}
+.footer-links {
+  display: flex;
+  gap: 0.9rem;
+}
+.footer-links span {
+  opacity: 0.7;
+}
+@media (max-width: 980px) {
+  .layout-grid {
+    grid-template-columns: 1fr;
+  }
+  .algorithm-list {
+    max-height: none;
+  }
+}
 @media (max-width: 640px) {
-  body { padding: 2rem 0.8rem 3rem; }
-  .card { padding: 1.4rem; }
+  body {
+    padding: 2.4rem 0.8rem 3rem;
+  }
+  .card {
+    padding: 1.4rem;
+  }
+  .button-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  button {
+    width: 100%;
+  }
 }
   </style>
 </head>
 <body>
-  <main class=\"app-shell\">
-    <header class=\"app-header\">
-      <div class=\"badge\">DevSkits916</div>
-      <h1>RNG Analyzer</h1>
-      <p class=\"subtitle\">Infer simple RNG parameters and explore sample generators.</p>
+  <main class="app-shell">
+    <header class="app-header">
+      <div class="badge">DevSkits916</div>
+      <h1>RNG Intelligence Console</h1>
+      <p class="subtitle">Identify, interrogate, and synthesise sequences across congruential, xor-based, cryptographic, quasi-random, and chaotic generators.</p>
     </header>
 
-    <form method=\"post\" class=\"card\">
-      <h2>Input</h2>
-      <label for=\"sequence\">Observed sequence (comma, space, or newline separated; hex like 0x123 allowed)</label>
-      <textarea id=\"sequence\" name=\"sequence\" rows=\"6\">{{ sequence }}</textarea>
-      <section class=\"options\">
-        <h2>Options</h2>
-        <div class=\"options-grid\">
-          <label>Forward predictions
-            <input type=\"number\" name=\"forward\" min=\"0\" value=\"{{ forward }}\" />
+    <section class="status-card">
+      <div class="status-tile">
+        <span class="status-label">Current mode</span>
+        <span class="status-value" id="status-mode">—</span>
+      </div>
+      <div class="status-tile">
+        <span class="status-label">Detection coverage</span>
+        <span class="status-value">{{ detectable_count }} / {{ total_count }}</span>
+      </div>
+      <div class="status-tile">
+        <span class="status-label">Sequence length</span>
+        <span class="status-value">{{ input_count }}</span>
+      </div>
+      <div class="status-tile">
+        <span class="status-label">Auto detection</span>
+        <span class="status-chip">{{ 'Enabled' if mode == 'auto' else 'Manual' }}</span>
+      </div>
+    </section>
+
+    <div class="layout-grid">
+      <form method="post" class="card">
+        <h2>Sequence intake</h2>
+        <label class="field-label" for="sequence">
+          Observed sequence or seed material
+          <span>Comma, space, or newline separated. Hex like 0x123 welcome.</span>
+        </label>
+        <textarea id="sequence" name="sequence" rows="6">{{ sequence }}</textarea>
+        <div class="options-grid">
+          <label>
+            <span class="field-label">Forward predictions / count</span>
+            <input type="number" name="forward" min="0" value="{{ forward }}" />
           </label>
-          <label>Backward predictions
-            <input type=\"number\" name=\"backward\" min=\"0\" value=\"{{ backward }}\" />
+          <label>
+            <span class="field-label">Backward predictions</span>
+            <input type="number" name="backward" min="0" value="{{ backward }}" />
           </label>
-          <label>Algorithm mode
-            <select name=\"mode\">
-              <option value=\"auto\" {% if mode == 'auto' %}selected{% endif %}>Auto Detect / Infer</option>
-              <option value=\"lcg\" {% if mode == 'lcg' %}selected{% endif %}>LCG (manual analyze)</option>
-              <option value=\"additive\" {% if mode == 'additive' %}selected{% endif %}>Additive (manual analyze)</option>
-              <option value=\"xorshift\" {% if mode == 'xorshift' %}selected{% endif %}>Xorshift demo</option>
-              <option value=\"mt19937\" {% if mode == 'mt19937' %}selected{% endif %}>MT19937 demo</option>
+          <label>
+            <span class="field-label">Algorithm mode</span>
+            <select name="mode">
+              <option value="auto" {% if mode == 'auto' %}selected{% endif %}>Auto Detect / Infer</option>
+              {% for category, items in algorithm_groups %}
+                <optgroup label="{{ category }}">
+                  {% for entry in items %}
+                    <option value="{{ entry.key }}" {% if mode == entry.key %}selected{% endif %}>{{ entry.label }}</option>
+                  {% endfor %}
+                </optgroup>
+              {% endfor %}
             </select>
           </label>
         </div>
-        <div class=\"button-row\">
-          <button type=\"submit\" class=\"primary\">Analyze / Predict</button>
-          <button type=\"submit\" name=\"load_sample\" value=\"1\">Load Sample Sequence for This Algorithm</button>
+        <div class="button-row">
+          <button type="submit" class="primary">Analyze / Predict</button>
+          <button type="submit" name="load_sample" value="1">Load Sample Configuration</button>
         </div>
-      </section>
-    </form>
+      </form>
 
-    <section class=\"card\" id=\"results-card\">
-      <h2>Results</h2>
-      <div class=\"results-section\">
+      <aside class="card info-panel">
+        <h2>Algorithm Atlas</h2>
+        <div class="algorithm-list">
+          {% for category, items in algorithm_groups %}
+            <div class="algorithm-group">
+              <span class="algorithm-group-title">{{ category }}</span>
+              <div class="chip-row">
+                {% for entry in items %}
+                  <button type="button" class="algo-chip" data-key="{{ entry.key }}">{{ entry.label }}</button>
+                {% endfor %}
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+        <div class="algorithm-meta">
+          <h3 id="algorithm-title">Select an algorithm</h3>
+          <div class="meta-badges">
+            <span class="meta-pill" id="algorithm-category">—</span>
+            <span class="meta-pill" id="algorithm-detection">—</span>
+          </div>
+          <p id="algorithm-description">Choose a generator to review its role and capabilities. Selecting a chip also tunes the form to that mode.</p>
+        </div>
+      </aside>
+    </div>
+
+    <section class="card results-card" id="results-card">
+      <div class="results-headline">
+        <h2>Results</h2>
+        {% if result.algorithm %}<span class="hint">Active algorithm: {{ result.algorithm }}</span>{% endif %}
+      </div>
+      <div class="results-section">
         <h3>Parameters</h3>
-        <pre id=\"parameters-output\">{{ result.parameters }}</pre>
+        <pre id="parameters-output">{{ result.parameters }}</pre>
       </div>
-      <div class=\"results-section\">
+      <div class="results-section">
         <h3>Forward predictions</h3>
-        <p class=\"hint\">Predicted states after your last provided number.</p>
-        <pre id=\"forward-output\">{{ result.forward }}</pre>
+        <p class="hint">Predicted or generated states after your last provided number.</p>
+        <pre id="forward-output">{{ result.forward }}</pre>
       </div>
-      <div class=\"results-section\">
+      <div class="results-section">
         <h3>Backward predictions</h3>
-        <p class=\"hint\">States before your first provided number (starting with immediately previous).</p>
-        <pre id=\"backward-output\">{{ result.backward }}</pre>
+        <p class="hint">States before your first provided number (where supported).</p>
+        <pre id="backward-output">{{ result.backward }}</pre>
       </div>
-      <div class=\"results-section\">
+      <div class="results-section">
         <h3>Generated sequence</h3>
-        <pre id=\"generated-output\">{{ result.generated }}</pre>
+        <pre id="generated-output">{{ result.generated }}</pre>
       </div>
     </section>
 
-    <section class=\"card {% if not result.error %}hidden{% endif %}\" id=\"error-card\">
+    <section class="card {% if not result.error %}hidden{% endif %}" id="error-card">
       <h2>Error</h2>
-      <pre id=\"error-output\">{{ result.error or '' }}</pre>
+      <pre id="error-output">{{ result.error or '' }}</pre>
     </section>
+
+    <footer class="app-footer">
+      <span>RNG Analyzer · Precision tooling for entropy sleuths</span>
+      <div class="footer-links">
+        <span>{{ total_count }} algorithms bundled</span>
+        <span>{{ detectable_count }} auto-detect capable</span>
+      </div>
+    </footer>
   </main>
+
+  <script>
+    const algorithmDetails = JSON.parse('{{ algorithm_details_json | safe }}');
+    const modeSelect = document.querySelector('select[name="mode"]');
+    const statusMode = document.getElementById('status-mode');
+    const chips = Array.from(document.querySelectorAll('.algo-chip'));
+    const title = document.getElementById('algorithm-title');
+    const category = document.getElementById('algorithm-category');
+    const detection = document.getElementById('algorithm-detection');
+    const description = document.getElementById('algorithm-description');
+
+    function describeDetection(meta) {
+      if (!meta) {
+        return '—';
+      }
+      return meta.supports_detection ? 'Auto detection ready' : 'Manual only';
+    }
+
+    function setActiveChip(key) {
+      chips.forEach((chip) => {
+        const active = chip.dataset.key === key;
+        chip.setAttribute('data-active', active);
+      });
+    }
+
+    function applySelection(key) {
+      const meta = algorithmDetails[key];
+      if (key === 'auto') {
+        statusMode.textContent = 'Auto Detect';
+        title.textContent = 'Auto detection';
+        category.textContent = 'Best-match inference';
+        detection.textContent = 'Scans all detectable algorithms';
+        description.textContent = 'Submit an observed sequence and the analyzer will interrogate each detectable generator until a match is confirmed.';
+        setActiveChip('');
+        return;
+      }
+      statusMode.textContent = meta ? meta.label : 'Manual';
+      if (meta) {
+        title.textContent = meta.label;
+        category.textContent = meta.category;
+        detection.textContent = describeDetection(meta);
+        description.textContent = meta.description || 'No description available.';
+      } else {
+        title.textContent = 'Custom algorithm';
+        category.textContent = '—';
+        detection.textContent = 'Manual selection';
+        description.textContent = 'Manual selections surface bespoke generator behaviour.';
+      }
+      setActiveChip(key);
+    }
+
+    if (modeSelect) {
+      applySelection(modeSelect.value);
+      modeSelect.addEventListener('change', (event) => {
+        applySelection(event.target.value);
+      });
+    }
+
+    chips.forEach((chip) => {
+      chip.addEventListener('click', () => {
+        const key = chip.dataset.key;
+        if (modeSelect) {
+          modeSelect.value = key;
+        }
+        applySelection(key);
+      });
+    });
+  </script>
 </body>
 </html>
-  """
+"""
 )
 
 
